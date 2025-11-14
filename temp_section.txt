@@ -1,0 +1,405 @@
+﻿@app.get("/api/dashboard", response_model=UserDashboardResponse)
+async def get_user_dashboard(
+    current_user: FirebaseUser = Depends(get_current_user)
+):
+    """
+    Get comprehensive dashboard data for the logged-in user.
+    Returns upcoming trip, past trips, saved destinations, personalized suggestions, and stats.
+    """
+    try:
+        user_id = current_user.uid
+        
+        # ====================================================================
+        # 1. FETCH USER PROFILE & TRIPS
+        # ====================================================================
+        profile = firestore_service.get_user_profile(user_id=user_id)
+        all_trips = firestore_service.get_user_trips(user_id=user_id)
+        
+        # Auto-trigger preference learning if user has trips but no learned preferences
+        if all_trips and len(all_trips) >= 2:
+            if not profile or not profile.get("learned_preferences"):
+                print(f"ðŸ§  Auto-triggering preference learning for {current_user.email}")
+                try:
+                    # Call the preference learning logic inline
+                    from collections import Counter
+                    import statistics
+                    
+                    destinations = [trip.get("destination", "").lower() for trip in all_trips]
+                    budgets = [trip.get("budget", 0) for trip in all_trips]
+                    durations = [trip.get("num_days", 0) for trip in all_trips]
+                    interests_list = [trip.get("interests", "") for trip in all_trips if trip.get("interests")]
+                    
+                    dest_counter = Counter(destinations)
+                    most_visited = [dest for dest, count in dest_counter.most_common(5)]
+                    
+                    avg_budget = statistics.mean(budgets) if budgets else 0
+                    avg_duration = statistics.mean(durations) if durations else 0
+                    daily_budget = avg_budget / avg_duration if avg_duration > 0 else 0
+                    
+                    if daily_budget < 2500:
+                        spending_pattern = "conservative"
+                        fav_budget_range = "â‚¹20,000 - â‚¹40,000 per trip"
+                    elif daily_budget < 6000:
+                        spending_pattern = "moderate"
+                        fav_budget_range = "â‚¹40,000 - â‚¹80,000 per trip"
+                    else:
+                        spending_pattern = "generous"
+                        fav_budget_range = "â‚¹80,000+ per trip"
+                    
+                    all_interests = []
+                    for interest_str in interests_list:
+                        all_interests.extend([i.strip().lower() for i in interest_str.split(",")])
+                    interest_counter = Counter(all_interests)
+                    recurring_interests = [interest for interest, count in interest_counter.most_common(5) if count > 1]
+                    
+                    learned_prefs = {
+                        "most_visited_destinations": most_visited[:5],
+                        "favorite_budget_range": fav_budget_range,
+                        "average_trip_duration": int(avg_duration),
+                        "recurring_interests": recurring_interests,
+                        "spending_pattern": spending_pattern,
+                        "last_analyzed": datetime.now()
+                    }
+                    
+                    if not profile:
+                        profile = {"email": current_user.email, "display_name": current_user.name, "preferences": {}}
+                    
+                    profile["learned_preferences"] = learned_prefs
+                    firestore_service.create_or_update_user_profile(user_id=user_id, profile_data=profile)
+                    print(f"âœ… Auto-learned preferences: {spending_pattern} pattern")
+                except Exception as e:
+                    print(f"âš ï¸ Auto-learning failed: {str(e)}")
+        
+        user_info = {
+            "email": current_user.email,
+            "display_name": profile.get("display_name") if profile else current_user.name,
+            "preferences": profile.get("preferences", {}) if profile else {},
+            "learned_preferences": profile.get("learned_preferences", {}) if profile else {},
+            "profile_completeness": profile.get("profile_completeness", 0) if profile else 0
+        }
+        
+        # ====================================================================
+        # 2. FETCH ALL TRIPS
+        # ====================================================================
+        all_trips = firestore_service.get_user_trips(user_id=user_id)
+        
+        # Most recent trip as "upcoming trip"
+        upcoming_trip = None
+        if all_trips:
+            latest = all_trips[0]  # Assuming sorted by created_at DESC
+            upcoming_trip = UpcomingTrip(
+                id=latest.get("id", ""),
+                destination=latest.get("destination", "Unknown"),
+                origin_city=latest.get("origin_city", "Unknown"),
+                num_days=latest.get("num_days", 0),
+                num_people=latest.get("num_people", 0),
+                budget=latest.get("budget", 0.0),
+                quick_preview=f"A {latest.get('num_days', 0)}-day adventure to {latest.get('destination', 'an amazing place')}"
+            )
+        
+        # Past trips (excluding the first one if it's the upcoming trip)
+        past_trips = []
+        for trip in all_trips[1:6]:  # Get up to 5 past trips
+            past_trips.append(TripSummary(
+                id=trip.get("id", ""),
+                destination=trip.get("destination", "Unknown"),
+                num_days=trip.get("num_days", 0),
+                created_at=trip.get("created_at"),
+                thumbnail_note=f"{trip.get('num_days', 0)} days â€¢ â‚¹{trip.get('budget', 0):,.0f}"
+            ))
+        
+        # ====================================================================
+        # 3. FETCH SAVED DESTINATIONS
+        # ====================================================================
+        saved_destinations = firestore_service.get_user_saved_destinations(user_id=user_id)
+        
+        # ====================================================================
+        # 4. CALCULATE STATS
+        # ====================================================================
+        total_budget = sum(trip.get("budget", 0) for trip in all_trips)
+        unique_destinations = len(set(trip.get("destination", "").lower() for trip in all_trips))
+        
+        stats = DashboardStats(
+            total_trips_planned=len(all_trips),
+            total_destinations=unique_destinations,
+            saved_destinations=len(saved_destinations),
+            total_budget_spent=total_budget
+        )
+        
+        # ====================================================================
+        # 5. GENERATE PERSONALIZED "FOR YOU" SUGGESTIONS (AI-POWERED)
+        # ====================================================================
+        personalized_suggestions = []
+        
+        # Build comprehensive user travel profile
+        if all_trips or profile:
+            # Gather trip history data
+            destinations_visited = [trip.get("destination", "") for trip in all_trips[:5]] if all_trips else []
+            interests_list = []
+            if all_trips:
+                for trip in all_trips[:3]:
+                    if trip.get("interests"):
+                        interests_list.append(trip.get("interests"))
+            
+            avg_budget = (total_budget / len(all_trips)) if all_trips else 50000
+            avg_days = (sum(trip.get("num_days", 0) for trip in all_trips) / len(all_trips)) if all_trips else 5
+            
+            # Extract user preferences and learned patterns
+            user_prefs = profile.get("preferences", {}) if profile else {}
+            learned_prefs = profile.get("learned_preferences", {}) if profile else {}
+            saved_dest_names = [d.get("destination_name", "") for d in saved_destinations]
+            
+            # Build rich preference context
+            preference_context = ""
+            if user_prefs:
+                if user_prefs.get("interests"):
+                    preference_context += f"\n- Saved Interests: {', '.join(user_prefs['interests'])}"
+                if user_prefs.get("travel_style"):
+                    preference_context += f"\n- Travel Style: {', '.join(user_prefs['travel_style'])}"
+                if user_prefs.get("preferred_destinations"):
+                    preference_context += f"\n- Loves: {', '.join(user_prefs['preferred_destinations'])}"
+                if user_prefs.get("food_preferences"):
+                    food_prefs = user_prefs['food_preferences']
+                    dietary = food_prefs.get('dietary', '')
+                    preference_context += f"\n- Food: {dietary}"
+                if user_prefs.get("must_have_activities"):
+                    preference_context += f"\n- Must-Have: {', '.join(user_prefs['must_have_activities'])}"
+            
+            if learned_prefs:
+                if learned_prefs.get("recurring_interests"):
+                    preference_context += f"\n- Proven Loves: {', '.join(learned_prefs['recurring_interests'])} (from trip history)"
+                if learned_prefs.get("spending_pattern"):
+                    preference_context += f"\n- Spending Style: {learned_prefs['spending_pattern']}"
+            
+            # Get current month for seasonal suggestions
+            current_month = datetime.now().strftime("%B")
+            
+            # Create ENHANCED AI prompt for personalized suggestions
+            suggestion_prompt = f"""You are an expert Indian travel advisor specializing in personalized recommendations. Generate 4 HIGHLY PERSONALIZED destination suggestions for this user.
+
+**COMPREHENSIVE USER PROFILE**:
+- Past Destinations: {', '.join(destinations_visited) if destinations_visited else 'New traveler'}
+- Trip History: {len(all_trips)} trips planned
+- Interests from Trips: {', '.join(interests_list) if interests_list else 'Not specified'}
+- Average Budget: â‚¹{avg_budget:,.0f}
+- Average Trip Duration: {avg_days:.0f} days
+- Saved Wishlist: {', '.join(saved_dest_names) if saved_dest_names else 'None yet'}
+{preference_context}
+
+**CURRENT CONTEXT**:
+- Current Month: {current_month} 2025
+- Season: {"Winter" if current_month in ["November", "December", "January", "February"] else "Monsoon" if current_month in ["June", "July", "August", "September"] else "Summer"}
+
+**YOUR MISSION**:
+Create 4 "FOR YOU" suggestions that feel INCREDIBLY PERSONAL, as if you know this traveler intimately:
+
+**SUGGESTION CATEGORIES** (Provide exactly ONE from each):
+
+1. **"Perfect Match" Destination** - The IDEAL next destination based on their proven preferences
+2. **"Trending Now" Experience** - Something happening RIGHT NOW (festival, season, event) that matches their interests
+3. **"Hidden Gem" Discovery** - An off-beat place they'd NEVER find but perfectly fits their style
+4. **"Wishlist Inspiration"** - Related to their saved destinations OR fills a gap in their travel style
+
+**CRITICAL REQUIREMENTS**:
+- Use FIRST PERSON language: "You'd love...", "Based on your love of...", "Perfect for your..."
+- Reference SPECIFIC user data: their interests, budget, past trips, saved destinations
+- Include TIMELY elements: current festivals, seasonal attractions, events happening now
+- Be ACTIONABLE: Include specific dates/events if relevant
+- Explain WHY it's "for you" - make the connection personal and obvious
+
+For each suggestion, provide:
+- **Destination Name**: [City/Region, India]
+- **Title**: [Personal, compelling one-liner addressing the user directly]
+- **Description**: [2-3 sentences making it irresistible - reference their interests]
+- **Reason**: [SPECIFIC personalization: "You loved [past trip], you'll love this because..." or "With your interest in [X]..."]
+- **Estimated Budget**: [â‚¹ range matching their typical spending]
+- **Best Time**: [When to go - be specific with current relevance]
+- **Category**: ["perfect_match" | "trending_now" | "hidden_gem" | "wishlist_inspiration"]
+- **Urgency**: [Optional: "Book by [date]" or "Festival on [dates]" if time-sensitive]
+
+Format as JSON array:
+[
+  {{
+    "destination": "Destination Name",
+    "title": "Personal Title Using 'You/Your'",
+    "description": "Compelling description...",
+    "reason": "Specific personalization referencing their data...",
+    "estimated_budget": "â‚¹40,000 - â‚¹60,000",
+    "best_time": "December 2025 for XYZ Festival",
+    "category": "trending_now",
+    "urgency": "Festival Dec 15-20, 2025"
+  }}
+]
+
+Return ONLY the JSON array, no other text.
+"""
+
+            try:
+                # Use Gemini to generate suggestions
+                llm = ChatGoogleGenerativeAI(
+                    model="models/gemini-2.5-flash",
+                    temperature=0.8,  # Higher temperature for creative suggestions
+                    google_api_key=os.getenv("GOOGLE_API_KEY")
+                )
+                
+                print(f"\n{'='*60}")
+                print(f"ðŸŽ¯ GENERATING 'FOR YOU' PERSONALIZED SUGGESTIONS")
+                print(f"   User: {current_user.email}")
+                if user_prefs.get("interests"):
+                    print(f"   Interests: {', '.join(user_prefs['interests'])}")
+                if learned_prefs.get("spending_pattern"):
+                    print(f"   Pattern: {learned_prefs['spending_pattern']}")
+                print(f"{'='*60}\n")
+                
+                response = llm.invoke(suggestion_prompt)
+                suggestions_text = response.content.strip()
+                
+                # Parse JSON response
+                import json
+                # Clean up markdown code blocks if present
+                if "```json" in suggestions_text:
+                    suggestions_text = suggestions_text.split("```json")[1].split("```")[0].strip()
+                elif "```" in suggestions_text:
+                    suggestions_text = suggestions_text.split("```")[1].split("```")[0].strip()
+                
+                suggestions_data = json.loads(suggestions_text)
+                
+                for suggestion in suggestions_data[:4]:  # Get all 4 suggestions
+                    personalized_suggestions.append(PersonalizedSuggestion(
+                        title=suggestion.get("title", ""),
+                        description=suggestion.get("description", ""),
+                        destination=suggestion.get("destination", ""),
+                        reason=suggestion.get("reason", ""),
+                        estimated_budget=suggestion.get("estimated_budget"),
+                        best_time=suggestion.get("best_time"),
+                        category=suggestion.get("category"),
+                        urgency=suggestion.get("urgency")
+                    ))
+                
+                print(f"âœ… Generated {len(personalized_suggestions)} 'FOR YOU' suggestions")
+                # Print categories for debugging
+                categories = [s.category for s in personalized_suggestions if s.category]
+                if categories:
+                    print(f"   Categories: {', '.join(categories)}")
+                print()
+                
+            except Exception as e:
+                print(f"âš ï¸ Could not generate AI suggestions: {str(e)}")
+                # Fallback suggestions based on available data
+                personalized_suggestions = [
+                    PersonalizedSuggestion(
+                        title="Your Next Adventure Awaits in Coorg",
+                        description="Discover lush coffee plantations, misty hills, and rich biodiversity in Coorg, Karnataka. Perfect for nature lovers and photography enthusiasts.",
+                        destination="Coorg",
+                        reason=f"Based on your average budget of â‚¹{avg_budget:,.0f}, this destination offers excellent value with diverse experiences",
+                        estimated_budget=f"â‚¹{avg_budget * 0.8:,.0f} - â‚¹{avg_budget * 1.2:,.0f}",
+                        best_time="October to March - Pleasant weather perfect for exploration",
+                        category="perfect_match",
+                        urgency=None
+                    )
+                ]
+        
+        else:
+            # No trips yet - provide popular starter destinations with personal touch
+            current_month = datetime.now().strftime("%B")
+            personalized_suggestions = [
+                PersonalizedSuggestion(
+                    title="Start Your Journey in God's Own Country",
+                    description="Experience Kerala's serene backwaters, pristine beaches, and rich cultural heritage. Perfect for first-time explorers who want diverse experiences in one state.",
+                    destination="Kerala",
+                    reason="Ideal first destination with something for everyone - nature, culture, adventure, and relaxation all in one place",
+                    estimated_budget="â‚¹40,000 - â‚¹70,000",
+                    best_time=f"{current_month} is great for Kerala - pleasant weather and fewer crowds",
+                    category="perfect_match",
+                    urgency=None
+                ),
+                PersonalizedSuggestion(
+                    title="Discover Rajasthan's Royal Heritage Right Now",
+                    description="Immerse yourself in vibrant colors, majestic forts, and desert landscapes. Winter is THE season to explore Rajasthan's cultural treasures.",
+                    destination="Jaipur & Udaipur",
+                    reason="November-December brings perfect weather and colorful festivals - your timing couldn't be better for Rajasthan",
+                    estimated_budget="â‚¹50,000 - â‚¹80,000",
+                    best_time="November to March - Festival season with ideal temperatures",
+                    category="trending_now",
+                    urgency="Peak season - book accommodations early"
+                ),
+                PersonalizedSuggestion(
+                    title="Experience the Himalayas: Adventure Awaits You",
+                    description="Find peace in the mountains with breathtaking views, adventure sports, and spiritual experiences in Himachal Pradesh.",
+                    destination="Himachal Pradesh",
+                    reason="Perfect for first-time mountain travelers - easily accessible with options from relaxed to adventurous",
+                    estimated_budget="â‚¹35,000 - â‚¹60,000",
+                    best_time="March to June for pleasant weather, Dec-Feb for snow",
+                    category="wishlist_inspiration",
+                    urgency=None
+                ),
+                PersonalizedSuggestion(
+                    title="Explore India's Hidden Gem: Meghalaya",
+                    description="Asia's cleanest village, living root bridges, and cascading waterfalls. Few travelers discover this northeastern paradise - be one of them.",
+                    destination="Meghalaya",
+                    reason="Off-beat destination perfect for travelers seeking unique, uncrowded experiences away from typical tourist circuits",
+                    estimated_budget="â‚¹30,000 - â‚¹55,000",
+                    best_time="October to May - Post-monsoon reveals lush green landscapes",
+                    category="hidden_gem",
+                    urgency=None
+                )
+            ]
+        
+        # ====================================================================
+        # 6. QUICK ACTIONS
+        # ====================================================================
+        quick_actions = [
+            {
+                "id": "plan_new_trip",
+                "label": "Plan New Trip",
+                "icon": "âœˆï¸",
+                "action": "/plan",
+                "color": "primary"
+            },
+            {
+                "id": "compare_destinations",
+                "label": "Compare Destinations",
+                "icon": "âš–ï¸",
+                "action": "/compare",
+                "color": "secondary"
+            },
+            {
+                "id": "view_saved",
+                "label": "Saved Destinations",
+                "icon": "â¤ï¸",
+                "action": "/saved",
+                "color": "accent"
+            },
+            {
+                "id": "edit_profile",
+                "label": "Edit Profile",
+                "icon": "ðŸ‘¤",
+                "action": "/profile",
+                "color": "neutral"
+            }
+        ]
+        
+        # ====================================================================
+        # 7. RETURN COMPLETE DASHBOARD
+        # ====================================================================
+        return UserDashboardResponse(
+            success=True,
+            message="Dashboard loaded successfully",
+            user_info=user_info,
+            upcoming_trip=upcoming_trip,
+            past_trips=past_trips,
+            saved_destinations=saved_destinations,
+            personalized_suggestions=personalized_suggestions,
+            stats=stats,
+            quick_actions=quick_actions
+        )
+        
+    except Exception as e:
+        print(f"âŒ Dashboard error: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Failed to load dashboard: {str(e)}")
+
+
+# ============================================================================
+# TRENDING SUGGESTIONS ENDPOINT (PUBLIC, NO AUTH REQUIRED)
