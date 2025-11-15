@@ -21,6 +21,21 @@ def initialize_firebase():
         print("[OK] Firebase already initialized")
     except ValueError:
         # Firebase not initialized, so initialize it
+        
+        # First try to get credentials from environment variable (Railway/Production)
+        credentials_json = os.getenv("FIREBASE_CREDENTIALS_JSON")
+        if credentials_json:
+            try:
+                import json
+                cred_dict = json.loads(credentials_json)
+                cred = credentials.Certificate(cred_dict)
+                firebase_admin.initialize_app(cred)
+                print("[OK] Firebase initialized from environment variable")
+                return True
+            except Exception as e:
+                print(f"[ERROR] Error parsing Firebase credentials from environment: {e}")
+        
+        # Fallback to file-based credentials (Development/Local)
         env_path = os.getenv("FIREBASE_CREDENTIALS_PATH")
         if env_path and os.path.exists(env_path):
             cred_path = env_path
@@ -29,13 +44,13 @@ def initialize_firebase():
 
         if not os.path.exists(cred_path):
             print(f"[ERROR] Firebase credentials file not found at: {cred_path}")
-            print("Download your service account JSON from Firebase Console and place it in the backend folder as 'firebase-credentials.json'.")
+            print("Set FIREBASE_CREDENTIALS_JSON environment variable with your service account JSON, or place firebase-credentials.json in the backend folder.")
             raise RuntimeError("Firebase credentials missing. Backend cannot start.")
 
         try:
             cred = credentials.Certificate(cred_path)
             firebase_admin.initialize_app(cred)
-            print("[OK] Firebase initialized successfully")
+            print("[OK] Firebase initialized from file")
         except Exception as e:
             print(f"[ERROR] Error initializing Firebase: {e}")
             raise
